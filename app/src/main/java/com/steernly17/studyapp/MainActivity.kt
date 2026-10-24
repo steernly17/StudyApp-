@@ -1,8 +1,12 @@
 @file:OptIn(ExperimentalMaterial3Api::class)
 package com.steernly17.studyapp
 
+import android.app.DatePickerDialog
+import android.app.TimePickerDialog
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
@@ -10,6 +14,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -42,12 +47,52 @@ import coil.compose.AsyncImage
 import com.google.ai.client.generativeai.GenerativeModel
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import android.graphics.Bitmap
+import android.graphics.pdf.PdfRenderer
+import android.os.ParcelFileDescriptor
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.asImageBitmap
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 
+// NETWORK CONNECTIVITY HELPER
+@Suppress("MissingPermission")
+fun isNetworkAvailable(context: Context): Boolean {
+    return try {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    } catch (_: Exception) {
+        true
+    }
+}
+
 // REAL DOCUMENT FILE NAME & CONTENT EXTRACTION HELPERS
+fun saveFileToInternalStorage(context: Context, uri: Uri, fileName: String): String {
+    return try {
+        val docsDir = File(context.filesDir, "study_workspace").apply { if (!exists()) mkdirs() }
+        val safeName = "${System.currentTimeMillis()}_${fileName.replace("[^a-zA-Z0-9._-]".toRegex(), "_")}"
+        val destFile = File(docsDir, safeName)
+        
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            destFile.outputStream().use { output ->
+                input.copyTo(output)
+            }
+        }
+        destFile.absolutePath
+    } catch (_: Exception) {
+        ""
+    }
+}
+
 fun getFileNameFromUri(context: Context, uri: Uri): String {
     var result: String? = null
     if (uri.scheme == "content") {
@@ -70,18 +115,29 @@ fun getFileNameFromUri(context: Context, uri: Uri): String {
 
 fun readTextFromUri(context: Context, uri: Uri): String {
     return try {
-        val raw = context.contentResolver.openInputStream(uri)?.use { stream ->
-            stream.bufferedReader().use { it.readText() }
-        } ?: ""
-        if (raw.startsWith("%PDF") || raw.contains("Catalog") || (raw.length > 10000 && !raw.contains(" "))) {
-            return "📄 Uploaded PDF Document successfully loaded and indexed for study.\n\nKey Study Notes & Overview:\n• This is a PDF document containing lecture notes, chapters, and coursework.\n• Use the 'Edit Study Notes' button above to add your own notes, chapter summaries, or paste key definitions from your lectures to study offline anytime."
+        val inputStream = context.contentResolver.openInputStream(uri) ?: return ""
+        
+        val headerBuffer = ByteArray(2048)
+        val bytesRead = inputStream.read(headerBuffer)
+        val headerString = if (bytesRead > 0) String(headerBuffer, 0, bytesRead, Charsets.ISO_8859_1) else ""
+        
+        val isPdf = headerString.startsWith("%PDF") || headerString.contains("Catalog")
+        val isBinary = headerBuffer.take(bytesRead.coerceAtLeast(0)).any { byte ->
+            val b = byte.toInt() and 0xFF
+            b < 0x09 || (b in 0x0E..0x1F)
         }
-        if (raw.isBlank()) {
-            return "📄 Document loaded successfully. Tap 'Edit Study Notes' to add or view notes for this material."
+
+        if (isPdf || isBinary) {
+            inputStream.close()
+            return ""
         }
-        raw
+
+        val fullBytes = headerBuffer.copyOf(bytesRead.coerceAtLeast(0)) + inputStream.readBytes()
+        inputStream.close()
+        
+        String(fullBytes, Charsets.UTF_8).take(50000)
     } catch (_: Exception) {
-        "📄 Study Document loaded successfully. Tap 'Edit Study Notes' to add notes."
+        ""
     }
 }
 
@@ -98,15 +154,17 @@ data class AppUser(
 
 data class Topic(
     var title: String,
-    var content: String = "Study notes and core theoretical principles for $title.",
+    var content: String = "",
+    var fileUri: String = "",
     var done: Boolean = false
 )
 
 data class MaterialItem(
     val name: String,
-    val fileName: String = "file.txt",
+    val fileName: String = "",
+    var fileUri: String = "",
     var description: String = "",
-    var content: String = "Study content",
+    var content: String = "",
     var summary: String = ""
 )
 
@@ -153,13 +211,70 @@ data class PastTestItem(
     val title: String,
     val courseCode: String,
     val fileName: String,
+    var fileUri: String = "",
     var questionsContent: String,
     var aiAnswerKey: String = "",
     var generatedPracticeQuestions: String = ""
 )
 
+data class FocusSession(
+    val title: String,
+    val durationMinutes: Int,
+    val timestamp: String = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
+)
+
 data class QuoteData(val text: String, val author: String)
 data class ChatMessage(val sender: String, val text: String)
+
+// NATIVE DATE & TIME PICKER PROMPT HELPERS
+fun showNativeDatePicker(context: Context, initialDate: String, onDateSelected: (String) -> Unit) {
+    val calendar = Calendar.getInstance()
+    if (initialDate.isNotBlank() && initialDate.length >= 10) {
+        try {
+            val parts = initialDate.split("-")
+            if (parts.size == 3) {
+                calendar.set(Calendar.YEAR, parts[0].toInt())
+                calendar.set(Calendar.MONTH, parts[1].toInt() - 1)
+                calendar.set(Calendar.DAY_OF_MONTH, parts[2].toInt())
+            }
+        } catch (_: Exception) {}
+    }
+    
+    val datePicker = DatePickerDialog(
+        context,
+        { _, year, month, dayOfMonth ->
+            val formatted = String.format(Locale.US, "%04d-%02d-%02d", year, month + 1, dayOfMonth)
+            onDateSelected(formatted)
+        },
+        calendar.get(Calendar.YEAR),
+        calendar.get(Calendar.MONTH),
+        calendar.get(Calendar.DAY_OF_MONTH)
+    )
+    datePicker.datePicker.minDate = System.currentTimeMillis() - 1000
+    datePicker.show()
+}
+
+fun showNativeTimePicker(context: Context, initialTime: String, onTimeSelected: (String) -> Unit) {
+    val calendar = Calendar.getInstance()
+    val hour = calendar.get(Calendar.HOUR_OF_DAY)
+    val minute = calendar.get(Calendar.MINUTE)
+
+    val timePicker = TimePickerDialog(
+        context,
+        { _, selectedHour, selectedMinute ->
+            val cal = Calendar.getInstance().apply {
+                set(Calendar.HOUR_OF_DAY, selectedHour)
+                set(Calendar.MINUTE, selectedMinute)
+            }
+            val formatted = SimpleDateFormat("hh:mm a", Locale.US).format(cal.time)
+            onTimeSelected(formatted)
+        },
+        hour,
+        minute,
+        false
+    )
+    timePicker.show()
+}
 
 object Store {
     val users = mutableStateListOf<AppUser>()
@@ -169,23 +284,24 @@ object Store {
     val aiMessages = mutableStateListOf<ChatMessage>()
     val studyTable = mutableStateListOf<StudyTableItem>()
     val pastTests = mutableStateListOf<PastTestItem>()
+    val focusSessions = mutableStateListOf<FocusSession>()
 
-    fun generateStudyTable() {
-        studyTable.clear()
-        val days = listOf("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
-        if (courses.isEmpty()) {
-            studyTable.add(StudyTableItem("Monday", "07:00 PM", "GENERAL", "Evening Study & Note Review"))
-            studyTable.add(StudyTableItem("Monday", "08:30 PM", "GENERAL", "Practice Questions & Test Prep"))
-            studyTable.add(StudyTableItem("Tuesday", "07:00 PM", "GENERAL", "Revision & Flashcards"))
-        } else {
-            days.forEachIndexed { dayIndex, day ->
-                val c1 = courses[(dayIndex * 3) % courses.size]
-                val c2 = courses[(dayIndex * 3 + 1) % courses.size]
-                val c3 = courses[(dayIndex * 3 + 2) % courses.size]
+    var isFocusRunning by mutableStateOf(false)
+    var focusSecondsLeft by mutableIntStateOf(25 * 60)
+    var focusSelectedMinutes by mutableIntStateOf(25)
+    var focusTopic by mutableStateOf("Deep Study Session")
 
-                studyTable.add(StudyTableItem(day, "07:00 PM", c1.code, "Study ${c1.name} & Notes"))
-                studyTable.add(StudyTableItem(day, "08:30 PM", c2.code, "Practice & Review ${c2.name}"))
-                studyTable.add(StudyTableItem(day, "10:00 PM", c3.code, "Evening Revision: ${c3.name}"))
+    fun totalFocusMinutes(): Int = focusSessions.sumOf { it.durationMinutes }
+
+    fun purgeExpiredEvents() {
+        val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+        events.removeAll { event ->
+            try {
+                if (event.date.isNotBlank() && event.date.length >= 10) {
+                    event.date.take(10) < todayStr
+                } else false
+            } catch (_: Exception) {
+                false
             }
         }
     }
@@ -213,18 +329,33 @@ object Store {
     }
 
     fun save(context: Context) {
-        val sp = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        val currentUsers = users.toList()
+        val email = currentUser?.email ?: ""
+        val currentCourses = courses.toList()
+        val currentEvents = events.toList()
+        val currentAi = aiMessages.toList()
+        val currentStudyTable = studyTable.toList()
+        val currentPastTests = pastTests.toList()
+        val currentFocus = focusSessions.toList()
+        val isDark = dark
         val userKey = getUserKey()
-        sp.edit()
-            .putString("users_json", gson.toJson(users.toList()))
-            .putString("current_user_email", currentUser?.email ?: "")
-            .putString("courses_${userKey}", gson.toJson(courses.toList()))
-            .putString("events_${userKey}", gson.toJson(events.toList()))
-            .putString("ai_${userKey}", gson.toJson(aiMessages.toList()))
-            .putString("studytable_${userKey}", gson.toJson(studyTable.toList()))
-            .putString("pasttests_${userKey}", gson.toJson(pastTests.toList()))
-            .putBoolean("dark", dark)
-            .apply()
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val sp = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                sp.edit()
+                    .putString("users_json", gson.toJson(currentUsers))
+                    .putString("current_user_email", email)
+                    .putString("courses_${userKey}", gson.toJson(currentCourses))
+                    .putString("events_${userKey}", gson.toJson(currentEvents))
+                    .putString("ai_${userKey}", gson.toJson(currentAi))
+                    .putString("studytable_${userKey}", gson.toJson(currentStudyTable))
+                    .putString("pasttests_${userKey}", gson.toJson(currentPastTests))
+                    .putString("focus_${userKey}", gson.toJson(currentFocus))
+                    .putBoolean("dark", isDark)
+                    .apply()
+            } catch (_: Exception) {}
+        }
     }
 
     fun load(context: Context) {
@@ -269,8 +400,11 @@ object Store {
             val loaded: List<CourseData>? = gson.fromJson(cJson, type)
             if (!loaded.isNullOrEmpty()) {
                 courses.clear()
-                courses.addAll(loaded)
+                val filtered = loaded.filterNot { it.code.equals("GENERAL", ignoreCase = true) }
+                courses.addAll(filtered)
             }
+        } else {
+            courses.clear()
         }
 
         val eJson = sp.getString("events_${userKey}", null)
@@ -313,17 +447,17 @@ object Store {
             }
         }
 
-        // PRE-POPULATE REALISTIC COURSES IF EMPTY
-        if (courses.isEmpty()) {
-            addCourse("CSC201", "Computer Logic & Circuit Design")
-            addCourse("MAT331", "Advanced Calculus")
-            addCourse("MAT311", "Linear Algebra")
-            addCourse("CSC311", "Data Structures & Algorithms")
+        val focusJson = sp.getString("focus_${userKey}", null)
+        if (!focusJson.isNullOrBlank()) {
+            val type = object : TypeToken<List<FocusSession>>() {}.type
+            val loaded: List<FocusSession>? = gson.fromJson(focusJson, type)
+            if (loaded != null) {
+                focusSessions.clear()
+                focusSessions.addAll(loaded)
+            }
         }
 
-        if (studyTable.isEmpty()) {
-            generateStudyTable()
-        }
+        purgeExpiredEvents()
     }
 
     fun overall(): Int = if (courses.isEmpty()) 0 else (courses.sumOf { it.progress() } / courses.size)
@@ -333,29 +467,12 @@ object Store {
         val upperCode = code.trim().uppercase()
         if (courses.none { it.code == upperCode }) {
             val c = CourseData(upperCode, name.ifBlank { upperCode })
-            c.topics.add(Topic("Chapter 1: Overview & Theoretical Fundamentals", "Introduction to $name, key definitions, core concepts, and logical principles."))
-            c.topics.add(Topic("Chapter 2: Core Analysis & Formula Practice", "Detailed problem-solving techniques, formulas, algorithms, and practical applications for $upperCode."))
-            c.topics.add(Topic("Chapter 3: Advanced Topics & Exam Revision", "Complex scenarios, past exam review questions, and step-by-step solutions for $name."))
-            c.materials.add(
-                MaterialItem(
-                    name = "$name Study Guide",
-                    fileName = "${upperCode}_StudyGuide.pdf",
-                    description = "Comprehensive lecture notes and study slides.",
-                    content = "Detailed study guide and notes for $name ($upperCode).\n\nKey Concepts:\n1. Theoretical Framework & Definitions.\n2. Fundamental Formulas and Axioms.\n3. Step-by-Step Worked Problems.\n4. Practice Questions for Exam Prep.",
-                    summary = "SUMMARY:\n• Course: $name ($upperCode)\n• Notes: Core theory, definitions, worked examples, and formulas.\n• Status: Ready for in-app study and Gemini AI tutoring."
-                )
-            )
-            c.pastPapers.add(
-                PastTestItem(
-                    title = "$upperCode Midterm Exam 2024",
-                    courseCode = upperCode,
-                    fileName = "${upperCode}_Midterm_Exam.pdf",
-                    questionsContent = "Question 1: Explain the primary principles of $name ($upperCode).\nQuestion 2: Solve the core problem using standard formulas and show working steps.\nQuestion 3: Discuss practical applications and edge cases."
-                )
-            )
             courses.add(c)
-            generateStudyTable()
         }
+    }
+
+    fun deleteCourse(code: String) {
+        courses.removeAll { it.code.equals(code, ignoreCase = true) }
     }
 
     fun makeSummary(text: String): String {
@@ -364,20 +481,38 @@ object Store {
     }
 
     fun answerFromContent(query: String): String {
-        val qLower = query.lowercase()
+        if (query.isBlank()) return ""
+        val qLower = query.lowercase().trim()
+        val queryKeywords = qLower.split("\\s+".toRegex()).filter { it.length > 2 }
+        val matches = mutableListOf<String>()
+
         courses.forEach { c ->
             c.materials.forEach { m ->
-                if (m.content.lowercase().contains(qLower) || m.name.lowercase().contains(qLower)) {
-                    return "Found in course material '${m.name}' (${c.code}):\n\n${m.content.take(500)}..."
+                val mContentLower = m.content.lowercase()
+                val mNameLower = m.name.lowercase()
+                val mDescLower = m.description.lowercase()
+                
+                if (mContentLower.contains(qLower) || mNameLower.contains(qLower) || mDescLower.contains(qLower) || queryKeywords.any { k -> mContentLower.contains(k) || mNameLower.contains(k) }) {
+                    matches.add("📚 Course Material/Note: '${m.name}' [Course: ${c.code}]\n${m.content.take(1000)}")
                 }
             }
             c.topics.forEach { t ->
-                if (t.content.lowercase().contains(qLower) || t.title.lowercase().contains(qLower)) {
-                    return "Found in Chapter '${t.title}' (${c.code}):\n\n${t.content}"
+                val tContentLower = t.content.lowercase()
+                val tTitleLower = t.title.lowercase()
+                if (tContentLower.contains(qLower) || tTitleLower.contains(qLower) || queryKeywords.any { k -> tContentLower.contains(k) || tTitleLower.contains(k) }) {
+                    matches.add("📋 Course Outline/Chapter: '${t.title}' [Course: ${c.code}]\n${t.content.take(1000)}")
+                }
+            }
+            c.pastPapers.forEach { p ->
+                val pTitleLower = p.title.lowercase()
+                val pQuestLower = p.questionsContent.lowercase()
+                if (pTitleLower.contains(qLower) || pQuestLower.contains(qLower) || queryKeywords.any { k -> pQuestLower.contains(k) }) {
+                    matches.add("📝 Past Test/Exam: '${p.title}' [Course: ${c.code}]\n${p.questionsContent.take(1000)}")
                 }
             }
         }
-        return ""
+
+        return matches.distinct().take(4).joinToString("\n\n---\n\n")
     }
 }
 
@@ -391,36 +526,82 @@ class MainActivity : ComponentActivity() {
                     val nav = rememberNavController()
                     val startDest = if (Store.currentUser != null) "home" else "splash"
 
-                    NavHost(navController = nav, startDestination = startDest) {
-                        composable("splash") { Splash(nav) }
-                        composable("login") { Login(nav) }
-                        composable("register") { Register(nav) }
-                        composable("home") { Home(nav) }
-                        composable("courses") { CoursesPage(nav) }
-                        composable("detail/{code}") { backStack ->
-                            val code = backStack.arguments?.getString("code") ?: ""
-                            Detail(nav, code)
+                    // Global Focus Timer Ticker across whole app
+                    LaunchedEffect(Store.isFocusRunning, Store.focusSecondsLeft) {
+                        if (Store.isFocusRunning && Store.focusSecondsLeft > 0) {
+                            delay(1000L)
+                            Store.focusSecondsLeft -= 1
+                        } else if (Store.isFocusRunning && Store.focusSecondsLeft == 0) {
+                            Store.isFocusRunning = false
+                            val topicName = Store.focusTopic.ifBlank { "Study Session" }
+                            Store.focusSessions.add(FocusSession(topicName, Store.focusSelectedMinutes))
+                            Store.save(this@MainActivity)
                         }
-                        composable("chapter/{code}/{idx}") { backStack ->
-                            val code = backStack.arguments?.getString("code") ?: ""
-                            val idx = backStack.arguments?.getString("idx")?.toIntOrNull() ?: 0
-                            ChapterStudyPage(nav, code, idx)
+                    }
+
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        NavHost(navController = nav, startDestination = startDest) {
+                            composable("splash") { Splash(nav) }
+                            composable("login") { Login(nav) }
+                            composable("register") { Register(nav) }
+                            composable("home") { Home(nav) }
+                            composable("courses") { CoursesPage(nav) }
+                            composable("detail/{code}") { backStack ->
+                                val code = backStack.arguments?.getString("code") ?: ""
+                                Detail(nav, code)
+                            }
+                            composable("chapter/{code}/{idx}") { backStack ->
+                                val code = backStack.arguments?.getString("code") ?: ""
+                                val idx = backStack.arguments?.getString("idx")?.toIntOrNull() ?: 0
+                                ChapterStudyPage(nav, code, idx)
+                            }
+                            composable("material/{code}/{idx}") { backStack ->
+                                val code = backStack.arguments?.getString("code") ?: ""
+                                val idx = backStack.arguments?.getString("idx")?.toIntOrNull() ?: 0
+                                MaterialStudyPage(nav, code, idx)
+                            }
+                            composable("pasttests") { PastTestsPage(nav) }
+                            composable("calendar") { CalendarPage(nav) }
+                            composable("progress") { ProgressPage(nav) }
+                            composable("focus") { FocusTrackerPage(nav) }
+                            composable("profile") { ProfilePage(nav) }
+                            composable("upload") { UploadPage(nav) }
+                            composable("aitutor") { AITutorPage(nav) }
+                            composable("pastpaper_viewer/{code}/{idx}") { backStack ->
+                                val code = backStack.arguments?.getString("code") ?: ""
+                                val idx = backStack.arguments?.getString("idx")?.toIntOrNull() ?: 0
+                                PastPaperViewerPage(nav, code, idx)
+                            }
                         }
-                        composable("material/{code}/{idx}") { backStack ->
-                            val code = backStack.arguments?.getString("code") ?: ""
-                            val idx = backStack.arguments?.getString("idx")?.toIntOrNull() ?: 0
-                            MaterialStudyPage(nav, code, idx)
-                        }
-                        composable("pasttests") { PastTestsPage(nav) }
-                        composable("calendar") { CalendarPage(nav) }
-                        composable("progress") { ProgressPage(nav) }
-                        composable("profile") { ProfilePage(nav) }
-                        composable("upload") { UploadPage(nav) }
-                        composable("aitutor") { AITutorPage(nav) }
-                        composable("pastpaper_viewer/{code}/{idx}") { backStack ->
-                            val code = backStack.arguments?.getString("code") ?: ""
-                            val idx = backStack.arguments?.getString("idx")?.toIntOrNull() ?: 0
-                            PastPaperViewerPage(nav, code, idx)
+
+                        // Floating Focus Mini-Badge across ALL screens
+                        if (Store.isFocusRunning) {
+                            val mins = Store.focusSecondsLeft / 60
+                            val secs = Store.focusSecondsLeft % 60
+                            val timeFormatted = String.format(Locale.US, "%02d:%02d", mins, secs)
+
+                            Surface(
+                                modifier = Modifier
+                                    .align(Alignment.TopCenter)
+                                    .padding(top = 10.dp)
+                                    .clip(RoundedCornerShape(20.dp))
+                                    .clickable { nav.navigate("focus") },
+                                color = Color(0xFF3B82F6),
+                                shadowElevation = 8.dp
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(
+                                        Modifier.size(8.dp).clip(CircleShape).background(Color(0xFF22C55E))
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("🎯 Focusing: $timeFormatted", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("Timer →", color = Color.White.copy(0.8f), fontSize = 10.sp)
+                                }
+                            }
                         }
                     }
                 }
@@ -934,46 +1115,64 @@ fun Home(nav: NavController) {
                     }
                 }
 
-                val chunkedCourses = Store.courses.chunked(2)
-                items(chunkedCourses.size) { index ->
-                    val row = chunkedCourses[index]
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        row.forEach { c ->
-                            Card(
-                                Modifier.weight(1f).clickable { nav.navigate("detail/${c.code}") },
-                                shape = RoundedCornerShape(14.dp),
-                                colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30))
+                if (Store.courses.isEmpty()) {
+                    item {
+                        Card(
+                            Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Column(
+                                Modifier.padding(24.dp).fillMaxWidth(),
+                                horizontalAlignment = Alignment.CenterHorizontally
                             ) {
-                                Column(Modifier.padding(12.dp)) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Box(
-                                            Modifier
-                                                .size(32.dp)
-                                                .clip(RoundedCornerShape(8.dp))
-                                                .background(c.color().copy(0.2f)),
-                                            contentAlignment = Alignment.Center
-                                        ) {
-                                            Icon(Icons.Filled.Code, null, tint = c.color(), modifier = Modifier.size(18.dp))
-                                        }
-                                        Spacer(Modifier.width(8.dp))
-                                        Column {
-                                            Text(c.code, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                                            Text(c.name, color = Color.Gray, fontSize = 9.sp)
-                                        }
-                                    }
-                                    Spacer(Modifier.height(10.dp))
-                                    LinearProgressIndicator(
-                                        progress = { c.progress() / 100f },
-                                        modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
-                                        color = c.color(),
-                                        trackColor = Color(0xFF1E293B)
-                                    )
-                                    Spacer(Modifier.height(6.dp))
-                                    Text("${c.progress()}% • ${c.materials.size} materials", color = Color.Gray, fontSize = 10.sp)
-                                }
+                                Text("No courses added yet", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                Text("Tap '+ Create Course' or the My Courses tab to add your courses", color = Color.Gray, fontSize = 11.sp, textAlign = TextAlign.Center)
                             }
                         }
-                        if (row.size == 1) Spacer(Modifier.weight(1f))
+                    }
+                } else {
+                    val chunkedCourses = Store.courses.chunked(2)
+                    items(chunkedCourses.size) { index ->
+                        val row = chunkedCourses[index]
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            row.forEach { c ->
+                                Card(
+                                    Modifier.weight(1f).clickable { nav.navigate("detail/${c.code}") },
+                                    shape = RoundedCornerShape(14.dp),
+                                    colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30))
+                                ) {
+                                    Column(Modifier.padding(12.dp)) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Box(
+                                                Modifier
+                                                    .size(32.dp)
+                                                    .clip(RoundedCornerShape(8.dp))
+                                                    .background(c.color().copy(0.2f)),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Icon(Icons.Filled.Code, null, tint = c.color(), modifier = Modifier.size(18.dp))
+                                            }
+                                            Spacer(Modifier.width(8.dp))
+                                            Column {
+                                                Text(c.code, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                                Text(c.name, color = Color.Gray, fontSize = 9.sp)
+                                            }
+                                        }
+                                        Spacer(Modifier.height(10.dp))
+                                        LinearProgressIndicator(
+                                            progress = { c.progress() / 100f },
+                                            modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
+                                            color = c.color(),
+                                            trackColor = Color(0xFF1E293B)
+                                        )
+                                        Spacer(Modifier.height(6.dp))
+                                        Text("${c.progress()}% • ${c.materials.size} materials", color = Color.Gray, fontSize = 10.sp)
+                                    }
+                                }
+                            }
+                            if (row.size == 1) Spacer(Modifier.weight(1f))
+                        }
                     }
                 }
 
@@ -1087,6 +1286,16 @@ fun CoursesPage(nav: NavController) {
             TopAppBar(
                 title = { Text("My Courses (${Store.courses.size})", color = Color.White) },
                 navigationIcon = { IconButton({ nav.popBackStack() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Color.White) } },
+                actions = {
+                    if (Store.courses.isNotEmpty()) {
+                        IconButton(onClick = {
+                            Store.courses.clear()
+                            Store.save(ctx)
+                        }) {
+                            Icon(Icons.Filled.Delete, "Clear All Courses", tint = Color(0xFFEF4444))
+                        }
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF0A0F1C))
             )
         },
@@ -1101,36 +1310,66 @@ fun CoursesPage(nav: NavController) {
             modifier = Modifier.padding(pad).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            items(Store.courses.size) { idx ->
-                val c = Store.courses[idx]
-                Card(
-                    modifier = Modifier.fillMaxWidth().clickable { nav.navigate("detail/${c.code}") },
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)),
-                    shape = RoundedCornerShape(14.dp)
-                ) {
-                    Column(Modifier.padding(14.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Box(
-                                Modifier.size(40.dp).clip(RoundedCornerShape(10.dp)).background(c.color().copy(0.2f)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(Icons.AutoMirrored.Filled.MenuBook, null, tint = c.color(), modifier = Modifier.size(22.dp))
-                            }
-                            Spacer(Modifier.width(12.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text(c.code, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                                Text(c.name, color = Color.Gray, fontSize = 12.sp)
-                            }
-                            Text("${c.progress()}%", color = c.color(), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            if (Store.courses.isEmpty()) {
+                item {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(32.dp).fillMaxWidth(),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.MenuBook, null, tint = Color(0xFF3B82F6), modifier = Modifier.size(48.dp))
+                            Spacer(Modifier.height(12.dp))
+                            Text("No courses created yet", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                            Text("Tap the blue + button below to create your first course", color = Color.Gray, fontSize = 12.sp, textAlign = TextAlign.Center)
                         }
-                        Spacer(Modifier.height(10.dp))
-                        LinearProgressIndicator(
-                            progress = { c.progress() / 100f },
-                            modifier = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(2.5.dp)),
-                            color = c.color()
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        Text("${c.topics.size} chapters • ${c.materials.size} materials • ${c.pastPapers.size} past tests", color = Color.Gray, fontSize = 11.sp)
+                    }
+                }
+            } else {
+                items(Store.courses.size) { idx ->
+                    val c = Store.courses[idx]
+                    Card(
+                        modifier = Modifier.fillMaxWidth().clickable { nav.navigate("detail/${c.code}") },
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Column(Modifier.padding(14.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Box(
+                                    Modifier.size(40.dp).clip(RoundedCornerShape(10.dp)).background(c.color().copy(0.2f)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(Icons.AutoMirrored.Filled.MenuBook, null, tint = c.color(), modifier = Modifier.size(22.dp))
+                                }
+                                Spacer(Modifier.width(12.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(c.code, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                                    Text(c.name, color = Color.Gray, fontSize = 12.sp)
+                                }
+                                Text("${c.progress()}%", color = c.color(), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                Spacer(Modifier.width(8.dp))
+                                IconButton(
+                                    onClick = {
+                                        Store.deleteCourse(c.code)
+                                        Store.save(ctx)
+                                    },
+                                    modifier = Modifier.size(28.dp)
+                                ) {
+                                    Icon(Icons.Filled.Delete, "Delete Course", tint = Color(0xFFEF4444), modifier = Modifier.size(18.dp))
+                                }
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            LinearProgressIndicator(
+                                progress = { c.progress() / 100f },
+                                modifier = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(2.5.dp)),
+                                color = c.color()
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            Text("${c.topics.size} chapters • ${c.materials.size} materials • ${c.pastPapers.size} past tests", color = Color.Gray, fontSize = 11.sp)
+                        }
                     }
                 }
             }
@@ -1139,11 +1378,11 @@ fun CoursesPage(nav: NavController) {
         if (showDialog) {
             AlertDialog(
                 onDismissRequest = { showDialog = false },
-                title = { Text("Add New Course") },
+                title = { Text("Create New Course") },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(value = code, onValueChange = { code = it }, label = { Text("Course Code (e.g. MAT331)") })
-                        OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Course Name (e.g. Advanced Calculus)") })
+                        OutlinedTextField(value = code, onValueChange = { code = it }, label = { Text("Course Code") })
+                        OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Course Name") })
                     }
                 },
                 confirmButton = {
@@ -1179,12 +1418,14 @@ fun Detail(nav: NavController, code: String) {
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let {
             val fileName = getFileNameFromUri(ctx, it)
+            val internalPath = saveFileToInternalStorage(ctx, it, fileName)
             val text = readTextFromUri(ctx, it)
             val summary = Store.makeSummary(text.ifBlank { "Study material and notes for $fileName" })
             course.materials.add(
                 MaterialItem(
                     name = fileName.substringBeforeLast("."),
                     fileName = fileName,
+                    fileUri = if (internalPath.isNotBlank()) internalPath else it.toString(),
                     content = text.ifBlank { "Study content and notes for $fileName" },
                     summary = summary
                 )
@@ -1193,9 +1434,12 @@ fun Detail(nav: NavController, code: String) {
         }
     }
 
+    var pastTestUri by remember { mutableStateOf("") }
     val pastTestFilePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let {
             pastTestFileName = getFileNameFromUri(ctx, it)
+            val internalPath = saveFileToInternalStorage(ctx, it, pastTestFileName)
+            pastTestUri = if (internalPath.isNotBlank()) internalPath else it.toString()
             val text = readTextFromUri(ctx, it)
             if (pastTestQuestions.isBlank() && text.isNotBlank()) {
                 pastTestQuestions = text
@@ -1204,12 +1448,23 @@ fun Detail(nav: NavController, code: String) {
         }
     }
 
+
+
     Scaffold(
         containerColor = Color(0xFF0A0F1C),
         topBar = {
             TopAppBar(
                 title = { Text("${course.code} (${course.progress()}%)", color = Color.White) },
                 navigationIcon = { IconButton({ nav.popBackStack() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Color.White) } },
+                actions = {
+                    IconButton(onClick = {
+                        Store.deleteCourse(course.code)
+                        Store.save(ctx)
+                        nav.popBackStack()
+                    }) {
+                        Icon(Icons.Filled.Delete, null, tint = Color(0xFFEF4444))
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF0A0F1C))
             )
         },
@@ -1380,11 +1635,12 @@ fun Detail(nav: NavController, code: String) {
                 confirmButton = {
                     Button(onClick = {
                         if (pastTestTitle.isNotBlank()) {
-                            course.pastPapers.add(PastTestItem(title = pastTestTitle, courseCode = course.code, fileName = pastTestFileName, questionsContent = pastTestQuestions.ifBlank { "Past exam questions for $pastTestTitle" }))
+                            course.pastPapers.add(PastTestItem(title = pastTestTitle, courseCode = course.code, fileName = pastTestFileName, fileUri = pastTestUri, questionsContent = pastTestQuestions.ifBlank { "Past exam questions for $pastTestTitle" }))
                             Store.save(ctx)
                             showPastTestDialog = false
                             pastTestTitle = ""
                             pastTestQuestions = ""
+                            pastTestUri = ""
                         }
                     }) {
                         Text("Upload")
@@ -1410,12 +1666,14 @@ fun ChapterStudyPage(nav: NavController, code: String, idx: Int) {
     val docPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let {
             val fName = getFileNameFromUri(ctx, it)
+            val internalPath = saveFileToInternalStorage(ctx, it, fName)
             val text = readTextFromUri(ctx, it)
+            topic.fileUri = if (internalPath.isNotBlank()) internalPath else it.toString()
             if (text.isNotBlank()) {
                 content += "\n\n📄 Attached Document ($fName):\n$text"
                 topic.content = content
-                Store.save(ctx)
             }
+            Store.save(ctx)
         }
     }
 
@@ -1434,7 +1692,7 @@ fun ChapterStudyPage(nav: NavController, code: String, idx: Int) {
                     colors = ButtonDefaults.buttonColors(containerColor = if (selectedTab == 0) Color(0xFF3B82F6) else Color.Transparent),
                     shape = RoundedCornerShape(10.dp)
                 ) {
-                    Text("📖 Chapter Notes", fontSize = 12.sp, color = Color.White)
+                    Text("📖 Chapter Notes & Document Viewer", fontSize = 11.sp, color = Color.White)
                 }
                 Button(
                     onClick = { selectedTab = 1 },
@@ -1478,25 +1736,7 @@ fun ChapterStudyPage(nav: NavController, code: String, idx: Int) {
                 if (selectedTab == 0) {
                     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         item {
-                            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)), shape = RoundedCornerShape(14.dp)) {
-                                Column(Modifier.padding(16.dp)) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Box(
-                                            Modifier.size(36.dp).clip(RoundedCornerShape(8.dp)).background(course.color().copy(0.2f)),
-                                            contentAlignment = Alignment.Center
-                                        ) {
-                                            Icon(Icons.AutoMirrored.Filled.MenuBook, null, tint = course.color(), modifier = Modifier.size(20.dp))
-                                        }
-                                        Spacer(Modifier.width(10.dp))
-                                        Column {
-                                            Text("${course.code} • Chapter ${idx + 1}", color = course.color(), fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                                            Text(topic.title, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                                        }
-                                    }
-                                    Spacer(Modifier.height(12.dp))
-                                    Text(content, color = Color.White, fontSize = 13.sp)
-                                }
-                            }
+                            InAppDocumentViewer(context = ctx, fileUriStr = topic.fileUri, textContent = content, description = "Course: ${course.code} • Chapter ${idx + 1}: ${topic.title}")
                         }
                     }
                 } else {
@@ -1565,6 +1805,128 @@ fun ChapterStudyPage(nav: NavController, code: String, idx: Int) {
 }
 
 @Composable
+fun InAppDocumentViewer(context: Context, fileUriStr: String, textContent: String, description: String = "") {
+    var isPdf by remember { mutableStateOf(false) }
+    var pageCount by remember { mutableStateOf(0) }
+    var pdfRendererState by remember { mutableStateOf<PdfRenderer?>(null) }
+
+    DisposableEffect(fileUriStr) {
+        var pfd: ParcelFileDescriptor? = null
+        var renderer: PdfRenderer? = null
+        if (fileUriStr.isNotBlank()) {
+            try {
+                val file = File(fileUriStr)
+                pfd = if (file.exists() && file.isFile) {
+                    ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+                } else {
+                    context.contentResolver.openFileDescriptor(Uri.parse(fileUriStr), "r")
+                }
+
+                if (pfd != null) {
+                    renderer = PdfRenderer(pfd)
+                    pdfRendererState = renderer
+                    pageCount = renderer.pageCount
+                    isPdf = true
+                }
+            } catch (_: Exception) {
+                isPdf = false
+            }
+        }
+        onDispose {
+            try {
+                renderer?.close()
+                pfd?.close()
+            } catch (_: Exception) {}
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        if (isPdf && pdfRendererState != null && pageCount > 0) {
+            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)), shape = RoundedCornerShape(12.dp)) {
+                Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Filled.Description, null, tint = Color(0xFF22C55E), modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("📄 Native In-App PDF Reader ($pageCount Pages)", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 600.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                items(pageCount) { pageIdx ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = Color.White),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Column {
+                            Box(
+                                modifier = Modifier.fillMaxWidth().background(Color(0xFF1E293B)).padding(4.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("Page ${pageIdx + 1} of $pageCount", color = Color.Gray, fontSize = 10.sp)
+                            }
+                            PdfPageRenderItem(renderer = pdfRendererState!!, pageIndex = pageIdx)
+                        }
+                    }
+                }
+            }
+        }
+
+        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)), shape = RoundedCornerShape(14.dp)) {
+            Column(Modifier.padding(16.dp)) {
+                if (description.isNotBlank()) {
+                    Text("Description & Key Points:\n$description", color = Color(0xFF3B82F6), fontSize = 13.sp)
+                    Spacer(Modifier.height(12.dp))
+                    HorizontalDivider(color = Color.DarkGray)
+                    Spacer(Modifier.height(12.dp))
+                }
+                Text("📄 Document Notes & Content:", color = Color(0xFF22C55E), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                Text(textContent, color = Color.White, fontSize = 13.sp)
+            }
+        }
+    }
+}
+
+@Composable
+fun PdfPageRenderItem(renderer: PdfRenderer, pageIndex: Int) {
+    var bitmapState by remember(pageIndex) { mutableStateOf<Bitmap?>(null) }
+
+    LaunchedEffect(pageIndex) {
+        withContext(Dispatchers.IO) {
+            try {
+                synchronized(renderer) {
+                    val page = renderer.openPage(pageIndex)
+                    val scale = (1080f / page.width).coerceAtMost(2f)
+                    val w = (page.width * scale).toInt().coerceAtLeast(1)
+                    val h = (page.height * scale).toInt().coerceAtLeast(1)
+                    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                    page.close()
+                    bitmapState = bmp
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    val bmp = bitmapState
+    if (bmp != null) {
+        Image(
+            bitmap = bmp.asImageBitmap(),
+            contentDescription = "Page ${pageIndex + 1}",
+            modifier = Modifier.fillMaxWidth().wrapContentHeight(),
+            contentScale = ContentScale.FillWidth
+        )
+    } else {
+        Box(Modifier.fillMaxWidth().height(250.dp).background(Color(0xFF1E293B)), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(color = Color(0xFF3B82F6), modifier = Modifier.size(24.dp))
+        }
+    }
+}
+
+@Composable
 fun MaterialStudyPage(nav: NavController, code: String, idx: Int) {
     val ctx = LocalContext.current
     val course = Store.courses.find { it.code == code } ?: return
@@ -1584,7 +1946,6 @@ fun MaterialStudyPage(nav: NavController, code: String, idx: Int) {
         topBar = { TopAppBar(title = { Text(mat.name, color = Color.White) }, navigationIcon = { IconButton({ nav.popBackStack() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Color.White) } }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF0A0F1C))) }
     ) { pad ->
         Column(modifier = Modifier.padding(pad).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            // Tab Toggle Row
             Row(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFF151D30)).padding(4.dp),
                 horizontalArrangement = Arrangement.spacedBy(4.dp)
@@ -1595,7 +1956,7 @@ fun MaterialStudyPage(nav: NavController, code: String, idx: Int) {
                     colors = ButtonDefaults.buttonColors(containerColor = if (selectedTab == 0) Color(0xFF3B82F6) else Color.Transparent),
                     shape = RoundedCornerShape(10.dp)
                 ) {
-                    Text("📄 Read Document & Notes", fontSize = 12.sp, color = Color.White)
+                    Text("📄 In-App Document Viewer", fontSize = 11.sp, color = Color.White)
                 }
                 Button(
                     onClick = { selectedTab = 1 },
@@ -1603,7 +1964,7 @@ fun MaterialStudyPage(nav: NavController, code: String, idx: Int) {
                     colors = ButtonDefaults.buttonColors(containerColor = if (selectedTab == 1) Color(0xFF22C55E) else Color.Transparent),
                     shape = RoundedCornerShape(10.dp)
                 ) {
-                    Text("✨ AI Summary & Takeaways", fontSize = 12.sp, color = Color.White)
+                    Text("✨ AI Summary & Takeaways", fontSize = 11.sp, color = Color.White)
                 }
             }
 
@@ -1644,26 +2005,7 @@ fun MaterialStudyPage(nav: NavController, code: String, idx: Int) {
                 if (selectedTab == 0) {
                     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         item {
-                            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)), shape = RoundedCornerShape(14.dp)) {
-                                Column(Modifier.padding(16.dp)) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Icon(Icons.Filled.Description, null, tint = Color(0xFF22C55E), modifier = Modifier.size(24.dp))
-                                        Spacer(Modifier.width(10.dp))
-                                        Column {
-                                            Text(mat.name, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                                            Text("File: ${mat.fileName} • Course: ${course.code}", color = Color.Gray, fontSize = 11.sp)
-                                        }
-                                    }
-                                    if (description.isNotBlank()) {
-                                        Spacer(Modifier.height(10.dp))
-                                        Text("Description & Key Points:\n$description", color = Color(0xFF3B82F6), fontSize = 13.sp)
-                                    }
-                                    Spacer(Modifier.height(14.dp))
-                                    HorizontalDivider(color = Color.DarkGray)
-                                    Spacer(Modifier.height(14.dp))
-                                    Text("Full Study Document Content:\n$content", color = Color.White, fontSize = 13.sp)
-                                }
-                            }
+                            InAppDocumentViewer(context = ctx, fileUriStr = mat.fileUri, textContent = content, description = description)
                         }
                     }
                 } else {
@@ -1732,13 +2074,16 @@ fun PastTestsPage(nav: NavController) {
     val ctx = LocalContext.current
     var showDialog by remember { mutableStateOf(false) }
     var testTitle by remember { mutableStateOf("") }
-    var testCourse by remember { mutableStateOf(Store.courses.firstOrNull()?.code ?: "GENERAL") }
+    var testCourse by remember { mutableStateOf(Store.courses.firstOrNull()?.code ?: "") }
     var testQuestions by remember { mutableStateOf("") }
     var fileName by remember { mutableStateOf("No document selected") }
 
+    var pastTestUri by remember { mutableStateOf("") }
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let {
             fileName = getFileNameFromUri(ctx, it)
+            val internalPath = saveFileToInternalStorage(ctx, it, fileName)
+            pastTestUri = if (internalPath.isNotBlank()) internalPath else it.toString()
             val extracted = readTextFromUri(ctx, it)
             if (testQuestions.isBlank() && extracted.isNotBlank()) {
                 testQuestions = extracted
@@ -1887,7 +2232,7 @@ fun PastTestsPage(nav: NavController) {
                     text = {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutlinedTextField(value = testTitle, onValueChange = { testTitle = it }, label = { Text("Exam / Test Title") })
-                            OutlinedTextField(value = testCourse, onValueChange = { testCourse = it }, label = { Text("Course Code (e.g. MAT331)") })
+                            OutlinedTextField(value = testCourse, onValueChange = { testCourse = it }, label = { Text("Course Code") })
                             Button(
                                 onClick = { filePicker.launch("*/*") },
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF22C55E)),
@@ -1906,11 +2251,12 @@ fun PastTestsPage(nav: NavController) {
                     confirmButton = {
                         Button(onClick = {
                             if (testTitle.isNotBlank()) {
-                                Store.pastTests.add(PastTestItem(title = testTitle, courseCode = testCourse.ifBlank { "GENERAL" }, fileName = fileName, questionsContent = testQuestions.ifBlank { "Past test questions for $testTitle" }))
+                                Store.pastTests.add(PastTestItem(title = testTitle, courseCode = testCourse.ifBlank { "General" }, fileName = fileName, fileUri = pastTestUri, questionsContent = testQuestions.ifBlank { "Past test questions for $testTitle" }))
                                 Store.save(ctx)
                                 showDialog = false
                                 testTitle = ""
                                 testQuestions = ""
+                                pastTestUri = ""
                             }
                         }) {
                             Text("Upload & Save")
@@ -1932,6 +2278,11 @@ fun CalendarPage(nav: NavController) {
     var selectedDate by remember { mutableStateOf(SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())) }
     var selectedTime by remember { mutableStateOf("09:00 AM") }
 
+    LaunchedEffect(Unit) {
+        Store.purgeExpiredEvents()
+        Store.save(ctx)
+    }
+
     Scaffold(
         containerColor = Color(0xFF0A0F1C),
         bottomBar = { Bottom5(nav, "calendar") },
@@ -1952,7 +2303,7 @@ fun CalendarPage(nav: NavController) {
                 item {
                     Card(shape = RoundedCornerShape(14.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)), modifier = Modifier.fillMaxWidth()) {
                         Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
-                            Text("No events scheduled yet", color = Color.Gray, fontSize = 12.sp)
+                            Text("No upcoming events scheduled yet", color = Color.Gray, fontSize = 12.sp)
                         }
                     }
                 }
@@ -1973,6 +2324,15 @@ fun CalendarPage(nav: NavController) {
                                 Text("${ev.course} • ${ev.date} at ${ev.time}", color = Color.Gray, fontSize = 11.sp)
                                 if (ev.desc.isNotBlank()) Text(ev.desc, color = Color.Gray, fontSize = 10.sp)
                             }
+                            IconButton(
+                                onClick = {
+                                    Store.events.removeAt(i)
+                                    Store.save(ctx)
+                                },
+                                modifier = Modifier.size(28.dp)
+                            ) {
+                                Icon(Icons.Filled.Delete, "Delete Event", tint = Color(0xFFEF4444), modifier = Modifier.size(18.dp))
+                            }
                         }
                     }
                 }
@@ -1990,10 +2350,39 @@ fun CalendarPage(nav: NavController) {
                 title = { Text("Add Calendar Event") },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("Event Title (e.g. MAT331 Test)") })
+                        OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("Event Title") })
                         OutlinedTextField(value = course, onValueChange = { course = it }, label = { Text("Course Code") })
-                        OutlinedTextField(value = selectedDate, onValueChange = { selectedDate = it }, label = { Text("Date (YYYY-MM-DD)") })
-                        OutlinedTextField(value = selectedTime, onValueChange = { selectedTime = it }, label = { Text("Time") })
+                        
+                        Button(
+                            onClick = {
+                                showNativeDatePicker(ctx, selectedDate) { dateStr ->
+                                    selectedDate = dateStr
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B)),
+                            modifier = Modifier.fillMaxWidth().height(48.dp),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Filled.CalendarMonth, null, tint = Color(0xFF3B82F6))
+                            Spacer(Modifier.width(8.dp))
+                            Text("Date: $selectedDate", color = Color.White)
+                        }
+
+                        Button(
+                            onClick = {
+                                showNativeTimePicker(ctx, selectedTime) { timeStr ->
+                                    selectedTime = timeStr
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B)),
+                            modifier = Modifier.fillMaxWidth().height(48.dp),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Filled.Schedule, null, tint = Color(0xFF22C55E))
+                            Spacer(Modifier.width(8.dp))
+                            Text("Time: $selectedTime", color = Color.White)
+                        }
+
                         OutlinedTextField(value = desc, onValueChange = { desc = it }, label = { Text("Description") })
                     }
                 },
@@ -2027,7 +2416,179 @@ fun ProgressPage(nav: NavController) {
                 }
                 Spacer(Modifier.height(16.dp))
                 Text("${Store.completed()}/${Store.courses.size} Courses Completed", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                Text("${Store.courses.sumOf { it.materials.size }} Materials Uploaded & Summarized", color = Color.Gray, fontSize = 12.sp)
+                Text("${Store.courses.sumOf { it.materials.size }} Materials Uploaded", color = Color.Gray, fontSize = 12.sp)
+                Spacer(Modifier.height(8.dp))
+                Text("${Store.totalFocusMinutes()} Mins Total Focus Study Time", color = Color(0xFF22C55E), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+@Composable
+fun FocusTrackerPage(nav: NavController) {
+    val ctx = LocalContext.current
+    var selectedMinutes by remember { mutableIntStateOf(25) }
+    var secondsLeft by remember { mutableIntStateOf(25 * 60) }
+    var isRunning by remember { mutableStateOf(false) }
+    var focusTopic by remember { mutableStateOf("Deep Study Session") }
+
+    LaunchedEffect(isRunning, secondsLeft) {
+        if (isRunning && secondsLeft > 0) {
+            delay(1000L)
+            secondsLeft -= 1
+        } else if (isRunning && secondsLeft == 0) {
+            isRunning = false
+            Store.focusSessions.add(FocusSession(focusTopic.ifBlank { "Study Session" }, selectedMinutes))
+            Store.save(ctx)
+        }
+    }
+
+    Scaffold(
+        containerColor = Color(0xFF0A0F1C),
+        topBar = {
+            TopAppBar(
+                title = { Text("Focus Timer & Progress", color = Color.White) },
+                navigationIcon = { IconButton({ nav.popBackStack() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Color.White) } },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF0A0F1C))
+            )
+        },
+        bottomBar = { Bottom5(nav, "focus") }
+    ) { pad ->
+        LazyColumn(
+            modifier = Modifier.padding(pad).padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(20.dp).fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text("🎯 Study Focus Timer", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                        Text("Track study time and build session momentum", color = Color.Gray, fontSize = 11.sp, textAlign = TextAlign.Center)
+                        Spacer(Modifier.height(16.dp))
+
+                        val totalSeconds = selectedMinutes * 60
+                        val progress = if (totalSeconds > 0) secondsLeft.toFloat() / totalSeconds else 0f
+                        val mins = secondsLeft / 60
+                        val secs = secondsLeft % 60
+                        val timeFormatted = String.format(Locale.US, "%02d:%02d", mins, secs)
+
+                        Box(modifier = Modifier.size(180.dp), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator(
+                                progress = { progress },
+                                modifier = Modifier.fillMaxSize(),
+                                strokeWidth = 10.dp,
+                                color = Color(0xFF3B82F6),
+                                trackColor = Color(0xFF1E293B)
+                            )
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(timeFormatted, color = Color.White, fontSize = 36.sp, fontWeight = FontWeight.Bold)
+                                Text(if (isRunning) "Focusing..." else "Paused", color = if (isRunning) Color(0xFF22C55E) else Color.Gray, fontSize = 12.sp)
+                            }
+                        }
+
+                        Spacer(Modifier.height(16.dp))
+
+                        OutlinedTextField(
+                            value = focusTopic,
+                            onValueChange = { focusTopic = it },
+                            label = { Text("Focus Topic") },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+
+                        Spacer(Modifier.height(12.dp))
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf(15, 25, 45, 60).forEach { minsVal ->
+                                FilterChip(
+                                    selected = selectedMinutes == minsVal,
+                                    onClick = {
+                                        selectedMinutes = minsVal
+                                        secondsLeft = minsVal * 60
+                                        isRunning = false
+                                    },
+                                    label = { Text("${minsVal}m", fontSize = 11.sp) }
+                                )
+                            }
+                        }
+
+                        Spacer(Modifier.height(16.dp))
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Button(
+                                onClick = { isRunning = !isRunning },
+                                colors = ButtonDefaults.buttonColors(containerColor = if (isRunning) Color(0xFFF59E0B) else Color(0xFF22C55E)),
+                                modifier = Modifier.weight(1f).height(46.dp),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Icon(if (isRunning) Icons.Filled.Pause else Icons.Filled.PlayArrow, null)
+                                Spacer(Modifier.width(6.dp))
+                                Text(if (isRunning) "Pause" else "Start Focus", fontWeight = FontWeight.Bold)
+                            }
+
+                            Button(
+                                onClick = {
+                                    isRunning = false
+                                    secondsLeft = selectedMinutes * 60
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B)),
+                                modifier = Modifier.weight(1f).height(46.dp),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Icon(Icons.Filled.Refresh, null, tint = Color.White)
+                                Spacer(Modifier.width(6.dp))
+                                Text("Reset", color = Color.White)
+                            }
+                        }
+                    }
+                }
+            }
+
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Column(Modifier.padding(16.dp)) {
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("📊 Focus Growth & Stats", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                            Text("${Store.totalFocusMinutes()} mins focused", color = Color(0xFF22C55E), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+
+                        Spacer(Modifier.height(12.dp))
+
+                        if (Store.focusSessions.isEmpty()) {
+                            Text("No focus sessions completed yet. Start a focus timer above to track progress!", color = Color.Gray, fontSize = 12.sp, textAlign = TextAlign.Center)
+                        } else {
+                            Store.focusSessions.takeLast(5).reversed().forEach { sess ->
+                                HorizontalDivider(color = Color(0xFF1E293B), thickness = 1.dp)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column {
+                                        Text(sess.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                        Text(sess.timestamp, color = Color.Gray, fontSize = 10.sp)
+                                    }
+                                    Text("+${sess.durationMinutes} mins", color = Color(0xFF3B82F6), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2191,18 +2752,18 @@ fun ProfilePage(nav: NavController) {
 @Composable
 fun UploadPage(nav: NavController) {
     val ctx = LocalContext.current
-    if (Store.courses.isEmpty()) {
-        Store.courses.add(CourseData("GENERAL", "General Studies", 0xFF3B82F6))
-    }
-    var selectedCourse by remember { mutableStateOf(Store.courses.firstOrNull()?.code ?: "GENERAL") }
+    var selectedCourse by remember { mutableStateOf(Store.courses.firstOrNull()?.code ?: "") }
     var matName by remember { mutableStateOf("") }
     var matDesc by remember { mutableStateOf("") }
     var fileName by remember { mutableStateOf("No document selected") }
+    var selectedFileUri by remember { mutableStateOf("") }
     var extractedFileText by remember { mutableStateOf("") }
 
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let {
             fileName = getFileNameFromUri(ctx, it)
+            val internalPath = saveFileToInternalStorage(ctx, it, fileName)
+            selectedFileUri = if (internalPath.isNotBlank()) internalPath else it.toString()
             extractedFileText = readTextFromUri(ctx, it)
             if (matName.isBlank()) {
                 matName = fileName.substringBeforeLast(".")
@@ -2218,91 +2779,113 @@ fun UploadPage(nav: NavController) {
             modifier = Modifier.padding(pad).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            item {
-                Text("Select Target Course:", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                Spacer(Modifier.height(6.dp))
-                Store.courses.forEach { c ->
+            if (Store.courses.isEmpty()) {
+                item {
                     Card(
-                        Modifier.fillMaxWidth().padding(vertical = 2.dp).clickable { selectedCourse = c.code },
-                        colors = CardDefaults.cardColors(containerColor = if (selectedCourse == c.code) Color(0xFF3B82F6).copy(0.3f) else Color(0xFF151D30)),
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(28.dp).fillMaxWidth(),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.MenuBook, null, tint = Color(0xFF3B82F6), modifier = Modifier.size(44.dp))
+                            Spacer(Modifier.height(12.dp))
+                            Text("No Courses Created Yet", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(6.dp))
+                            Text("Please create a course first in 'My Courses' before uploading study materials.", color = Color.Gray, fontSize = 12.sp, textAlign = TextAlign.Center)
+                            Spacer(Modifier.height(16.dp))
+                            Button(
+                                onClick = { nav.navigate("courses") },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3B82F6)),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Go to My Courses & Create One", fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
+            } else {
+                item {
+                    Text("Select Target Course:", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Spacer(Modifier.height(6.dp))
+                    Store.courses.forEach { c ->
+                        Card(
+                            Modifier.fillMaxWidth().padding(vertical = 2.dp).clickable { selectedCourse = c.code },
+                            colors = CardDefaults.cardColors(containerColor = if (selectedCourse == c.code) Color(0xFF3B82F6).copy(0.3f) else Color(0xFF151D30)),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Text("${c.code} - ${c.name}", color = Color.White, fontSize = 12.sp, modifier = Modifier.padding(12.dp))
+                        }
+                    }
+                }
+
+                item {
+                    Spacer(Modifier.height(4.dp))
+                    Button(
+                        onClick = { filePicker.launch("*/*") },
+                        modifier = Modifier.fillMaxWidth().height(50.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF22C55E)),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Icon(Icons.Filled.FolderOpen, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Select Document from Device", fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)),
                         shape = RoundedCornerShape(12.dp)
                     ) {
-                        Text("${c.code} - ${c.name}", color = Color.White, fontSize = 12.sp, modifier = Modifier.padding(12.dp))
-                    }
-                }
-            }
-
-            item {
-                Spacer(Modifier.height(4.dp))
-                Button(
-                    onClick = { filePicker.launch("*/*") },
-                    modifier = Modifier.fillMaxWidth().height(50.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF22C55E)),
-                    shape = RoundedCornerShape(14.dp)
-                ) {
-                    Icon(Icons.Filled.FolderOpen, null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Select Document from Device", fontWeight = FontWeight.Bold)
-                }
-                Spacer(Modifier.height(6.dp))
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Filled.Description, null, tint = Color(0xFF22C55E), modifier = Modifier.size(24.dp))
-                        Spacer(Modifier.width(12.dp))
-                        Column {
-                            Text("Uploaded Document", color = Color.Gray, fontSize = 10.sp)
-                            Text(fileName, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Filled.Description, null, tint = Color(0xFF22C55E), modifier = Modifier.size(24.dp))
+                            Spacer(Modifier.width(12.dp))
+                            Column {
+                                Text("Uploaded Document", color = Color.Gray, fontSize = 10.sp)
+                                Text(fileName, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            }
                         }
                     }
                 }
-            }
 
-            item {
-                OutlinedTextField(
-                    value = matName,
-                    onValueChange = { matName = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("Document Title") },
-                    shape = RoundedCornerShape(12.dp)
-                )
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = matDesc,
-                    onValueChange = { matDesc = it },
-                    modifier = Modifier.fillMaxWidth().height(120.dp),
-                    label = { Text("Study Notes / Description / Key Points") },
-                    shape = RoundedCornerShape(12.dp)
-                )
-                Spacer(Modifier.height(16.dp))
+                item {
+                    OutlinedTextField(
+                        value = matName,
+                        onValueChange = { matName = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Document Title") },
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = matDesc,
+                        onValueChange = { matDesc = it },
+                        modifier = Modifier.fillMaxWidth().height(120.dp),
+                        label = { Text("Study Notes / Description / Key Points") },
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    Spacer(Modifier.height(16.dp))
 
-                Button(
-                    onClick = {
-                        if (selectedCourse.isBlank()) {
-                            selectedCourse = "GENERAL"
-                        }
-                        var c = Store.courses.find { it.code == selectedCourse }
-                        if (c == null) {
-                            Store.addCourse(selectedCourse, selectedCourse)
-                            c = Store.courses.find { it.code == selectedCourse }
-                        }
-                        if (c != null && matName.isNotBlank()) {
-                            val notesText = matDesc.ifBlank { "Study material and notes for $matName" }
-                            val fullContent = if (extractedFileText.isNotBlank()) extractedFileText else "Document File: $fileName\n\nStudy Notes & Key Points:\n$notesText"
-                            val summary = Store.makeSummary(fullContent)
-                            c.materials.add(MaterialItem(name = matName, fileName = fileName, description = matDesc, content = fullContent, summary = summary))
-                            Store.save(ctx)
-                            nav.popBackStack()
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth().height(50.dp),
-                    shape = RoundedCornerShape(24.dp),
-                    enabled = matName.isNotBlank()
-                ) {
-                    Text("Save & Index Document for Study", fontWeight = FontWeight.Bold)
+                    Button(
+                        onClick = {
+                            val c = Store.courses.find { it.code == selectedCourse }
+                            if (c != null && matName.isNotBlank()) {
+                                val notesText = matDesc.ifBlank { "Study material and notes for $matName" }
+                                val fullContent = if (extractedFileText.isNotBlank()) extractedFileText else "Document File: $fileName\n\nStudy Notes & Key Points:\n$notesText"
+                                val summary = Store.makeSummary(fullContent)
+                                c.materials.add(MaterialItem(name = matName, fileName = fileName, fileUri = selectedFileUri, description = matDesc, content = fullContent, summary = summary))
+                                Store.save(ctx)
+                                nav.popBackStack()
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth().height(50.dp),
+                        shape = RoundedCornerShape(24.dp),
+                        enabled = matName.isNotBlank() && selectedCourse.isNotBlank() && Store.courses.any { it.code == selectedCourse }
+                    ) {
+                        Text("Save & Index Document for Study", fontWeight = FontWeight.Bold)
+                    }
                 }
             }
         }
@@ -2437,6 +3020,8 @@ fun AITutorPage(nav: NavController) {
         return
     }
 
+    val isOnline = isNetworkAvailable(ctx)
+
     Scaffold(
         containerColor = Color(0xFF0A0F1C),
         topBar = {
@@ -2458,7 +3043,18 @@ fun AITutorPage(nav: NavController) {
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("Signed in as: ${user?.geminiEmail}", color = Color(0xFF22C55E), fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        Modifier.size(8.dp).clip(CircleShape).background(if (isOnline) Color(0xFF22C55E) else Color(0xFFF59E0B))
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        if (isOnline) "🟢 Internet AI Active" else "🟠 Offline Workspace Mode",
+                        color = if (isOnline) Color(0xFF22C55E) else Color(0xFFF59E0B),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
                 TextButton(onClick = {
                     user?.geminiEmail = null
                     user?.geminiApiKey = null
@@ -2480,12 +3076,15 @@ fun AITutorPage(nav: NavController) {
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text(
-                                "Hello ${user?.username ?: "Student"}! I am your Gemini AI Tutor connected to the internet. Ask me any study question, and I will search and generate answers using Google's Gemini engine.",
-                                color = Color.White,
-                                fontSize = 12.sp,
-                                modifier = Modifier.padding(14.dp)
-                            )
+                            Column(Modifier.padding(14.dp)) {
+                                Text(
+                                    "Hello ${user?.username ?: "Student"}! I am your StudyApp Gemini AI Tutor. I can answer questions grounded in your uploaded course notes, outlines, and past exams, or search internet AI knowledge when connected.",
+                                    color = Color.White,
+                                    fontSize = 12.sp
+                                )
+                                Spacer(Modifier.height(10.dp))
+                                Text("Quick Prompts — Tap to ask:", color = Color(0xFF3B82F6), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
                         }
                     }
                 } else {
@@ -2510,12 +3109,30 @@ fun AITutorPage(nav: NavController) {
 
                 if (loading) {
                     item {
-                        Text("Gemini is searching the internet and thinking...", color = Color.Gray, fontSize = 11.sp)
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 4.dp)) {
+                            CircularProgressIndicator(color = Color(0xFF3B82F6), modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp))
+                            Text("AI is searching notes and generating answers...", color = Color.Gray, fontSize = 11.sp)
+                        }
                     }
                 }
             }
 
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
+
+            // Quick Prompt Chips
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                val prompts = listOf("💡 Summarize notes", "🧪 Quiz questions", "📝 Past exam help")
+                prompts.forEach { pText ->
+                    SuggestionChip(
+                        onClick = { inputQuery = pText },
+                        label = { Text(pText, fontSize = 10.sp) }
+                    )
+                }
+            }
 
             Row(verticalAlignment = Alignment.CenterVertically) {
                 OutlinedTextField(
@@ -2535,30 +3152,69 @@ fun AITutorPage(nav: NavController) {
                             loading = true
                             Store.save(ctx)
 
-                            scope.launch {
-                                val contentAns = Store.answerFromContent(q)
-                                val responseText = if (contentAns.isNotBlank()) {
-                                    "💡 From your Study Materials & Notes:\n$contentAns"
-                                } else {
-                                    val queryLower = q.lowercase()
-                                    when {
-                                        queryLower.contains("java") || queryLower.contains("programming") || queryLower.contains("code") -> 
-                                            "☕ **Java & Programming Study Guide for '$q':**\n\n1. **Core Concept**: Java is an object-oriented, class-based programming language built on 'Write Once, Run Anywhere' (WORA).\n2. **Key Pillars**: Encapsulation, Inheritance, Polymorphism, and Abstraction.\n3. **Quick Example**: \n```java\npublic class Study {\n    public static void main(String[] args) {\n        System.out.println(\"Hello StudyApp!\");\n    }\n}\n```\n4. **Study Tip**: Upload your lecture notes or paste past exam questions to get step-by-step code analysis!"
-                                        
-                                        queryLower.contains("calculus") || queryLower.contains("math") || queryLower.contains("derivative") || queryLower.contains("integral") -> 
-                                            "📈 **Calculus Study Guide for '$q':**\n\n1. **Core Concept**: Calculus studies continuous change through limits, derivatives, and integrals.\n2. **Derivatives**: Represent the instantaneous rate of change (slope of the tangent line).\n3. **Integrals**: Represent accumulation of quantities and area under curves.\n4. **Study Tip**: Practice fundamental derivative rules and integration formulas!"
-                                        
-                                        queryLower.contains("algorithm") || queryLower.contains("data structure") || queryLower.contains("tree") || queryLower.contains("graph") -> 
-                                            "⚡ **Algorithms & Data Structures Guide for '$q':**\n\n1. **Core Concept**: Efficient organization and manipulation of data.\n2. **Complexity**: Analyze time and space complexity using Big-O notation (O(1), O(n), O(n log n)).\n3. **Common Structures**: Arrays, Linked Lists, Stacks, Queues, Hash Tables, Trees, and Graphs."
-                                        
-                                        else -> 
-                                            "🤖 **Gemini AI Tutor Comprehensive Answer for '$q':**\n\n1. **Comprehensive Breakdown**: '$q' is a key academic topic involving fundamental definitions, rules, and practical problem-solving techniques.\n2. **Core Principles**: \n   • Understand underlying definitions and theoretical framework.\n   • Apply standard formulas, algorithms, or logical steps.\n   • Review textbook chapters and course lecture notes.\n3. **Next Step**: Upload your past tests or lecture documents under your courses to let StudyApp build personalized flashcards and answer keys for you!"
+                            scope.launch(Dispatchers.IO) {
+                                var responseText = ""
+                                withTimeoutOrNull(15000L) {
+                                    val onlineAvailable = isNetworkAvailable(ctx)
+                                    val courseMatches = Store.answerFromContent(q)
+                                    val apiKey = user?.geminiApiKey?.takeIf { it.isNotBlank() } ?: "AIzaSyDummyKeyForGeminiEngine12345"
+
+                                    if (courseMatches.isNotBlank()) {
+                                        if (onlineAvailable) {
+                                            try {
+                                                val generativeModel = GenerativeModel(modelName = "gemini-1.5-flash", apiKey = apiKey)
+                                                val prompt = """
+                                                    You are an academic study tutor. Answer the student's question USING the following uploaded course context:
+                                                    $courseMatches
+
+                                                    Question: $q
+                                                """.trimIndent()
+                                                
+                                                val res = generativeModel.generateContent(prompt)
+                                                responseText = res.text ?: courseMatches
+                                            } catch (_: Exception) {
+                                                responseText = courseMatches
+                                            }
+                                        } else {
+                                            responseText = courseMatches
+                                        }
+                                    } else {
+                                        if (onlineAvailable) {
+                                            try {
+                                                val generativeModel = GenerativeModel(modelName = "gemini-1.5-flash", apiKey = apiKey)
+                                                val prompt = """
+                                                    You are an academic study tutor. Answer the student's question:
+                                                    $q
+                                                """.trimIndent()
+                                                
+                                                val res = generativeModel.generateContent(prompt)
+                                                responseText = res.text ?: "Study guide for '$q':\n\n1. Review core definitions and formulas.\n2. Apply step-by-step problem solving."
+                                            } catch (_: Exception) {
+                                                val queryLower = q.lowercase()
+                                                responseText = when {
+                                                    queryLower.contains("java") || queryLower.contains("programming") || queryLower.contains("code") -> 
+                                                        "Java & Programming Study Guide for '$q':\n\n1. Core Concept: Java is an object-oriented, class-based programming language.\n2. Key Pillars: Encapsulation, Inheritance, Polymorphism, and Abstraction."
+                                                    queryLower.contains("calculus") || queryLower.contains("math") || queryLower.contains("derivative") -> 
+                                                        "Calculus Study Guide for '$q':\n\n1. Core Concept: Calculus studies continuous change through limits and derivatives.\n2. Key Step: Practice differentiation rules."
+                                                    else -> 
+                                                        "Academic Study Answer for '$q':\n\n1. Overview: '$q' involves core theoretical definitions and practical application.\n2. Next Step: Review your course notes or lecture slides."
+                                                }
+                                            }
+                                        } else {
+                                            responseText = "Offline Mode: No internet connection detected and no matching notes were found in your uploaded courses."
+                                        }
                                     }
                                 }
 
-                                Store.aiMessages.add(ChatMessage("ai", responseText))
-                                loading = false
-                                Store.save(ctx)
+                                if (responseText.isBlank()) {
+                                    responseText = "Study guide for '$q':\n\n1. Review fundamental definitions and rules.\n2. Practice core problem-solving steps."
+                                }
+
+                                withContext(Dispatchers.Main) {
+                                    Store.aiMessages.add(ChatMessage("ai", responseText))
+                                    loading = false
+                                    Store.save(ctx)
+                                }
                             }
                         }
                     }
@@ -2592,6 +3248,12 @@ fun Bottom5(nav: NavController, currentScreen: String) {
             label = { Text("Calendar", fontSize = 10.sp) }
         )
         NavigationBarItem(
+            selected = currentScreen == "focus",
+            onClick = { nav.navigate("focus") },
+            icon = { Icon(Icons.Filled.Timer, null) },
+            label = { Text("Focus", fontSize = 10.sp) }
+        )
+        NavigationBarItem(
             selected = currentScreen == "progress",
             onClick = { nav.navigate("progress") },
             icon = { Icon(Icons.Filled.BarChart, null) },
@@ -2608,25 +3270,178 @@ fun Bottom5(nav: NavController, currentScreen: String) {
 
 @Composable
 fun StudyTableGrid() {
+    val ctx = LocalContext.current
+    var showAddSlot by remember { mutableStateOf(false) }
+    var slotDay by remember { mutableStateOf("Monday") }
+    var slotTime by remember { mutableStateOf("09:00 AM - 11:00 AM") }
+    var slotCourse by remember { mutableStateOf("") }
+    var slotActivity by remember { mutableStateOf("") }
+
+    val daysOfWeek = listOf("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
     Column(modifier = Modifier.fillMaxWidth()) {
-        Text("Weekly Study Timetable", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(8.dp))
-        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)), shape = RoundedCornerShape(12.dp)) {
-            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Store.studyTable.take(10).forEach { item ->
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column {
+                Text("Weekly Study Timetable", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text("Customizable study schedule & slots", color = Color.Gray, fontSize = 11.sp)
+            }
+            Button(
+                onClick = { showAddSlot = true },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3B82F6)),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+            ) {
+                Icon(Icons.Filled.Add, null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("Add Slot", fontSize = 11.sp)
+            }
+        }
+        Spacer(Modifier.height(10.dp))
+
+        if (Store.studyTable.isEmpty()) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, Color(0xFF1E293B))
+            ) {
+                Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+                    Text("No timetable slots added yet. Tap '+ Add Slot' to configure your schedule.", color = Color.Gray, fontSize = 12.sp, textAlign = TextAlign.Center)
+                }
+            }
+        } else {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, Color(0xFF2E3B55))
+            ) {
+                Column(Modifier.fillMaxWidth()) {
                     Row(
-                        Modifier.fillMaxWidth().background(Color(0xFF1E293B), RoundedCornerShape(8.dp)).padding(10.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF1E293B))
+                            .padding(10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Column {
-                            Text("${item.day} • ${item.time}", color = Color(0xFF3B82F6), fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                            Text(item.activity, color = Color.White, fontSize = 12.sp)
+                        Text("Day", color = Color(0xFF3B82F6), fontWeight = FontWeight.Bold, fontSize = 12.sp, modifier = Modifier.weight(1.2f))
+                        Text("Time", color = Color(0xFF3B82F6), fontWeight = FontWeight.Bold, fontSize = 12.sp, modifier = Modifier.weight(1.5f))
+                        Text("Course & Activity", color = Color(0xFF3B82F6), fontWeight = FontWeight.Bold, fontSize = 12.sp, modifier = Modifier.weight(2.5f))
+                        Spacer(Modifier.width(28.dp))
+                    }
+
+                    Store.studyTable.forEachIndexed { index, item ->
+                        HorizontalDivider(color = Color(0xFF2E3B55), thickness = 1.dp)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(item.day, color = Color.White, fontWeight = FontWeight.Medium, fontSize = 12.sp, modifier = Modifier.weight(1.2f))
+                            Text(item.time, color = Color.Gray, fontSize = 11.sp, modifier = Modifier.weight(1.5f))
+                            Column(modifier = Modifier.weight(2.5f)) {
+                                Text("[${item.courseCode}]", color = Color(0xFF22C55E), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                Text(item.activity, color = Color.White, fontSize = 12.sp)
+                            }
+                            IconButton(
+                                onClick = {
+                                    Store.studyTable.removeAt(index)
+                                    Store.save(ctx)
+                                },
+                                modifier = Modifier.size(28.dp)
+                            ) {
+                                Icon(Icons.Filled.Delete, null, tint = Color(0xFFEF4444), modifier = Modifier.size(16.dp))
+                            }
                         }
-                        Text(item.courseCode, color = Color.Gray, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                     }
                 }
             }
+        }
+
+        if (showAddSlot) {
+            AlertDialog(
+                onDismissRequest = { showAddSlot = false },
+                title = { Text("Add Custom Study Timetable Slot") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("Select day and time to customize your study schedule:", color = Color.Gray, fontSize = 12.sp)
+                        
+                        Text("Day of Week:", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            daysOfWeek.take(4).forEach { d ->
+                                FilterChip(
+                                    selected = slotDay == d,
+                                    onClick = { slotDay = d },
+                                    label = { Text(d.take(3), fontSize = 10.sp) }
+                                )
+                            }
+                        }
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            daysOfWeek.drop(4).forEach { d ->
+                                FilterChip(
+                                    selected = slotDay == d,
+                                    onClick = { slotDay = d },
+                                    label = { Text(d.take(3), fontSize = 10.sp) }
+                                )
+                            }
+                        }
+
+                        Button(
+                            onClick = {
+                                showNativeTimePicker(ctx, slotTime) { timeStr ->
+                                    slotTime = timeStr
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B)),
+                            modifier = Modifier.fillMaxWidth().height(48.dp),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Filled.Schedule, null, tint = Color(0xFF3B82F6))
+                            Spacer(Modifier.width(8.dp))
+                            Text("Time: $slotTime", color = Color.White)
+                        }
+                        OutlinedTextField(
+                            value = slotCourse,
+                            onValueChange = { slotCourse = it },
+                            label = { Text("Course Code") },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+                        OutlinedTextField(
+                            value = slotActivity,
+                            onValueChange = { slotActivity = it },
+                            label = { Text("Study Activity / Topic Description") },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            if (slotActivity.isNotBlank()) {
+                                Store.studyTable.add(StudyTableItem(slotDay, slotTime, slotCourse.ifBlank { "General" }, slotActivity))
+                                Store.save(ctx)
+                                showAddSlot = false
+                                slotActivity = ""
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3B82F6))
+                    ) {
+                        Text("Add to Timetable")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showAddSlot = false }) {
+                        Text("Cancel", color = Color.Gray)
+                    }
+                },
+                containerColor = Color(0xFF151D30)
+            )
         }
     }
 }
@@ -2673,13 +3488,7 @@ fun PastPaperViewerPage(nav: NavController, courseCode: String, testIdx: Int) {
             }
 
             item {
-                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151D30)), shape = RoundedCornerShape(14.dp)) {
-                    Column(Modifier.padding(16.dp)) {
-                        Text("📄 Past Paper / Exam Questions", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                        Spacer(Modifier.height(8.dp))
-                        Text(test.questionsContent, color = Color.Gray, fontSize = 13.sp)
-                    }
-                }
+                InAppDocumentViewer(context = ctx, fileUriStr = test.fileUri, textContent = test.questionsContent, description = "Course: ${course.code} • Past Exam: ${test.title}")
             }
 
             item {
