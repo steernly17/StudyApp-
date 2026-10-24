@@ -6,12 +6,14 @@ An advanced Android study workspace application designed to streamline student p
 
 ## 📥 Direct APK Download & Installation
 
-Click the link below to download the compiled Android APK file directly to your phone:
+Click either link below to download the compiled Android APK file directly to your phone:
 
-👉 **[Download StudyApp.apk (Direct Download)](https://raw.githubusercontent.com/steernly17/StudyApp/main/StudyApp.apk)**
+👉 **[Download StudyApp.apk (Direct Download)](https://github.com/steernly17/StudyApp/raw/main/StudyApp.apk)**
+
+Alternative Link: **[View StudyApp.apk on GitHub](https://github.com/steernly17/StudyApp/blob/main/StudyApp.apk)**
 
 ### 📱 How to Install on Android
-1. Tap the **[Download StudyApp.apk](https://raw.githubusercontent.com/steernly17/StudyApp/main/StudyApp.apk)** link above on your phone.
+1. Tap the **[Download StudyApp.apk](https://github.com/steernly17/StudyApp/raw/main/StudyApp.apk)** link above on your phone.
 2. Open the downloaded `StudyApp.apk` file on your device.
 3. If prompted, enable **"Allow from this source"** or **"Install Unknown Apps"** in your device settings.
 4. Tap **Install** and open **StudyApp**!
