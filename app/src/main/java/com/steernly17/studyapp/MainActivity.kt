@@ -313,10 +313,17 @@ object Store {
         QuoteData("We are only Superlatively smart tomorrow", "Steernly"),
         QuoteData("Life is like riding a bicycle. To keep your balance, you must keep moving.", "Albert Einstein"),
         QuoteData("Education is not the learning of facts, but the training of the mind to think.", "Albert Einstein"),
+        QuoteData("I am always ready to learn although I do always like being taught.", "Winston Churchill"),
+        QuoteData("Tell me and I forget, teach me and I may remember, involve me and I learn.", "Benjamin Franklin"),
         QuoteData("Imagination is more important than knowledge.", "Albert Einstein"),
-        QuoteData("Success is not final, failure is not fatal: it is the courage to continue that counts.", "Winston Churchill"),
+        QuoteData("You don't understand anything until you learn it more than one day.", "Marvin Minsky"),
+        QuoteData("He who laughs more, learns best.", "John Cleese"),
+        QuoteData("The beautiful thing about studying is nobody can take it away from you.", "B.B. King"),
+        QuoteData("I never learned from a man who agreed with me.", "Robert A. Heinlein"),
+        QuoteData("What we learn with pleasure we never forget.", "Alfred Mercier"),
+        QuoteData("Spoon feeding in the long run teaches us nothing but the shape of the spoon.", "E.M. Forster"),
         QuoteData("The future belongs to those who believe in the beauty of their dreams.", "Eleanor Roosevelt"),
-        QuoteData("Don't watch the clock; do what it does. Keep going.", "Sam Levenson")
+        QuoteData("It does not matter how slowly you go, as long as you don't stop.", "Confucius")
     )
 
     var dark by mutableStateOf(true)
