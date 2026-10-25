@@ -701,10 +701,10 @@ fun Login(nav: NavController) {
         Spacer(Modifier.height(20.dp))
         Button(
             onClick = {
-                val match = Store.users.find { (it.email.equals(emailOrUser, true) || it.username.equals(emailOrUser, true)) && it.pass == pass }
+                val inputStr = emailOrUser.trim()
+                val match = Store.users.find { (it.email.equals(inputStr, true) || it.username.equals(inputStr, true)) && it.pass == pass }
                 if (match != null) {
                     Store.currentUser = match
-                    Store.load(ctx)
                     Store.save(ctx)
                     nav.navigate("home") { popUpTo("login") { inclusive = true } }
                 } else {
@@ -742,7 +742,6 @@ fun Login(nav: NavController) {
                     Store.users.add(googleUser)
                 }
                 Store.currentUser = googleUser
-                Store.load(ctx)
                 Store.save(ctx)
                 nav.navigate("home") { popUpTo("login") { inclusive = true } }
             },
@@ -811,13 +810,20 @@ fun Register(nav: NavController) {
         Spacer(Modifier.height(20.dp))
         Button(
             onClick = {
-                if (fullName.isBlank() || username.isBlank() || email.isBlank() || pass.isBlank()) {
+                val fName = fullName.trim()
+                val uName = username.trim()
+                val eMail = email.trim()
+                if (fName.isBlank() || uName.isBlank() || eMail.isBlank() || pass.isBlank()) {
                     err = "Please fill in all fields"
                 } else {
-                    val user = AppUser(fullName = fullName, username = username, email = email, pass = pass)
-                    Store.users.add(user)
-                    Store.currentUser = user
-                    Store.load(ctx)
+                    val newUser = AppUser(fullName = fName, username = uName, email = eMail, pass = pass)
+                    val idx = Store.users.indexOfFirst { it.email.equals(eMail, ignoreCase = true) || it.username.equals(uName, ignoreCase = true) }
+                    if (idx != -1) {
+                        Store.users[idx] = newUser
+                    } else {
+                        Store.users.add(newUser)
+                    }
+                    Store.currentUser = newUser
                     Store.save(ctx)
                     nav.navigate("home") { popUpTo("register") { inclusive = true } }
                 }
@@ -841,7 +847,6 @@ fun Register(nav: NavController) {
                     Store.users.add(googleUser)
                 }
                 Store.currentUser = googleUser
-                Store.load(ctx)
                 Store.save(ctx)
                 nav.navigate("home") { popUpTo("register") { inclusive = true } }
             },
