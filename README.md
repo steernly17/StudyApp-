@@ -1,6 +1,6 @@
 # 📚 StudyApp v2.0 - All-in-One Android Study Assistant
 
-An advanced Android study workspace application designed to streamline student productivity with user-created courses, native in-app document & PDF viewing, a grounded AI Tutor, persistent focus mode, and customizable study timetables.
+An advanced Android study workspace application designed to streamline student productivity with user-created courses, **17 Viewer** native in-app document & PDF viewing, a grounded AI Tutor, persistent global focus mode, and customizable study timetables.
 
 ---
 
@@ -23,7 +23,7 @@ Alternative Link: **[View StudyApp.apk on GitHub](https://github.com/steernly17/
 ## ✨ Key Features & Capabilities
 
 - 📚 **User-Created Courses & Workspace**: Create your custom courses with dedicated slots for **Course Outlines**, **Study Notes & Documents**, and **Past Exams**.
-- 📄 **Native In-App PDF & Document Reader**: Renders PDFs page-by-page natively inside the app without needing external apps.
+- 📄 **17 Viewer (Native In-App PDF & Document Reader)**: Renders PDFs page-by-page natively inside the app without needing external apps.
 - 🎯 **Global App-Level Focus Timer**: Start a Pomodoro/Focus study session and navigate freely across courses, notes, and AI Tutor while a floating badge (`🎯 Focusing: 24:50`) tracks your time.
 - 🤖 **Grounded Gemini AI Tutor**: Answers study queries by searching your uploaded notes first, or queries live internet AI when connected.
 - 📅 **Calendar & Smart Expiration**: Visual Date & Time picker prompts for setting study events. Past events are automatically cleared upon day passage.

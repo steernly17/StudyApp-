@@ -372,24 +372,11 @@ object Store {
             }
         }
 
-        if (users.isEmpty()) {
-            val defaultUser = AppUser(
-                fullName = "Student User",
-                username = "student",
-                email = "student@gmail.com",
-                pass = "password123",
-                geminiEmail = "student@gmail.com",
-                geminiApiKey = "AIzaSyDummyKeyForGeminiEngine12345"
-            )
-            users.add(defaultUser)
-        }
-
         val savedEmail = sp.getString("current_user_email", null)
         if (!savedEmail.isNullOrBlank()) {
             currentUser = users.find { it.email.equals(savedEmail, ignoreCase = true) }
-        }
-        if (currentUser == null) {
-            currentUser = users.firstOrNull()
+        } else {
+            currentUser = null
         }
 
         val userKey = getUserKey()
@@ -2427,21 +2414,6 @@ fun ProgressPage(nav: NavController) {
 @Composable
 fun FocusTrackerPage(nav: NavController) {
     val ctx = LocalContext.current
-    var selectedMinutes by remember { mutableIntStateOf(25) }
-    var secondsLeft by remember { mutableIntStateOf(25 * 60) }
-    var isRunning by remember { mutableStateOf(false) }
-    var focusTopic by remember { mutableStateOf("Deep Study Session") }
-
-    LaunchedEffect(isRunning, secondsLeft) {
-        if (isRunning && secondsLeft > 0) {
-            delay(1000L)
-            secondsLeft -= 1
-        } else if (isRunning && secondsLeft == 0) {
-            isRunning = false
-            Store.focusSessions.add(FocusSession(focusTopic.ifBlank { "Study Session" }, selectedMinutes))
-            Store.save(ctx)
-        }
-    }
 
     Scaffold(
         containerColor = Color(0xFF0A0F1C),
@@ -2470,13 +2442,13 @@ fun FocusTrackerPage(nav: NavController) {
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text("🎯 Study Focus Timer", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                        Text("Track study time and build session momentum", color = Color.Gray, fontSize = 11.sp, textAlign = TextAlign.Center)
+                        Text("Timer stays active in background while you read courses in 17 Viewer!", color = Color.Gray, fontSize = 11.sp, textAlign = TextAlign.Center)
                         Spacer(Modifier.height(16.dp))
 
-                        val totalSeconds = selectedMinutes * 60
-                        val progress = if (totalSeconds > 0) secondsLeft.toFloat() / totalSeconds else 0f
-                        val mins = secondsLeft / 60
-                        val secs = secondsLeft % 60
+                        val totalSeconds = Store.focusSelectedMinutes * 60
+                        val progress = if (totalSeconds > 0) Store.focusSecondsLeft.toFloat() / totalSeconds else 0f
+                        val mins = Store.focusSecondsLeft / 60
+                        val secs = Store.focusSecondsLeft % 60
                         val timeFormatted = String.format(Locale.US, "%02d:%02d", mins, secs)
 
                         Box(modifier = Modifier.size(180.dp), contentAlignment = Alignment.Center) {
@@ -2489,15 +2461,15 @@ fun FocusTrackerPage(nav: NavController) {
                             )
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Text(timeFormatted, color = Color.White, fontSize = 36.sp, fontWeight = FontWeight.Bold)
-                                Text(if (isRunning) "Focusing..." else "Paused", color = if (isRunning) Color(0xFF22C55E) else Color.Gray, fontSize = 12.sp)
+                                Text(if (Store.isFocusRunning) "Focusing Active..." else "Paused", color = if (Store.isFocusRunning) Color(0xFF22C55E) else Color.Gray, fontSize = 12.sp)
                             }
                         }
 
                         Spacer(Modifier.height(16.dp))
 
                         OutlinedTextField(
-                            value = focusTopic,
-                            onValueChange = { focusTopic = it },
+                            value = Store.focusTopic,
+                            onValueChange = { Store.focusTopic = it },
                             label = { Text("Focus Topic") },
                             modifier = Modifier.fillMaxWidth(),
                             shape = RoundedCornerShape(12.dp)
@@ -2508,11 +2480,11 @@ fun FocusTrackerPage(nav: NavController) {
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             listOf(15, 25, 45, 60).forEach { minsVal ->
                                 FilterChip(
-                                    selected = selectedMinutes == minsVal,
+                                    selected = Store.focusSelectedMinutes == minsVal,
                                     onClick = {
-                                        selectedMinutes = minsVal
-                                        secondsLeft = minsVal * 60
-                                        isRunning = false
+                                        Store.focusSelectedMinutes = minsVal
+                                        Store.focusSecondsLeft = minsVal * 60
+                                        Store.isFocusRunning = false
                                     },
                                     label = { Text("${minsVal}m", fontSize = 11.sp) }
                                 )
@@ -2523,20 +2495,20 @@ fun FocusTrackerPage(nav: NavController) {
 
                         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             Button(
-                                onClick = { isRunning = !isRunning },
-                                colors = ButtonDefaults.buttonColors(containerColor = if (isRunning) Color(0xFFF59E0B) else Color(0xFF22C55E)),
+                                onClick = { Store.isFocusRunning = !Store.isFocusRunning },
+                                colors = ButtonDefaults.buttonColors(containerColor = if (Store.isFocusRunning) Color(0xFFF59E0B) else Color(0xFF22C55E)),
                                 modifier = Modifier.weight(1f).height(46.dp),
                                 shape = RoundedCornerShape(12.dp)
                             ) {
-                                Icon(if (isRunning) Icons.Filled.Pause else Icons.Filled.PlayArrow, null)
+                                Icon(if (Store.isFocusRunning) Icons.Filled.Pause else Icons.Filled.PlayArrow, null)
                                 Spacer(Modifier.width(6.dp))
-                                Text(if (isRunning) "Pause" else "Start Focus", fontWeight = FontWeight.Bold)
+                                Text(if (Store.isFocusRunning) "Pause" else "Start Focus", fontWeight = FontWeight.Bold)
                             }
 
                             Button(
                                 onClick = {
-                                    isRunning = false
-                                    secondsLeft = selectedMinutes * 60
+                                    Store.isFocusRunning = false
+                                    Store.focusSecondsLeft = Store.focusSelectedMinutes * 60
                                 },
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B)),
                                 modifier = Modifier.weight(1f).height(46.dp),
